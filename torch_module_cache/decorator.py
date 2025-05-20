@@ -136,6 +136,102 @@ def cache_module(
                 # Create cache directory if it doesn't exist
                 if not self._cache_subdir.exists():
                     self._cache_subdir.mkdir(parents=True, exist_ok=True)
+            
+            # Overrides for nn.Module methods that would affect device/dtype
+            original_to = self.to
+            @functools.wraps(original_to)
+            def to_wrapper(*args, **kwargs):
+                # Update cached device and dtype if present in args/kwargs
+                if not self._model_initialized:
+                    # Extract device from args/kwargs
+                    if args and isinstance(args[0], (torch.device, str, int)):
+                        self._cached_device = torch.device(args[0])
+                    elif "device" in kwargs:
+                        self._cached_device = torch.device(kwargs["device"])
+                        
+                    # Extract dtype from args/kwargs
+                    dtype_arg_index = 1 if args and isinstance(args[0], (torch.device, str, int)) else 0
+                    if len(args) > dtype_arg_index and isinstance(args[dtype_arg_index], torch.dtype):
+                        self._cached_dtype = args[dtype_arg_index]
+                    elif "dtype" in kwargs:
+                        self._cached_dtype = kwargs["dtype"]
+                    
+                    # Just return self since the model isn't initialized yet
+                    return self
+                # If initialized, call the original to() method
+                return original_to(*args, **kwargs)
+            
+            # Override type() method
+            original_type = self.type
+            @functools.wraps(original_type)
+            def type_wrapper(dtype=None, *args, **kwargs):
+                if not self._model_initialized and dtype is not None:
+                    # Track the requested dtype
+                    if isinstance(dtype, str):
+                        # Convert string dtype to torch.dtype
+                        dtype_map = {
+                            'torch.FloatTensor': torch.float32,
+                            'torch.DoubleTensor': torch.float64,
+                            'torch.HalfTensor': torch.float16,
+                            'torch.BFloat16Tensor': torch.bfloat16,
+                            'torch.ByteTensor': torch.uint8,
+                            'torch.CharTensor': torch.int8,
+                            'torch.ShortTensor': torch.int16,
+                            'torch.IntTensor': torch.int32,
+                            'torch.LongTensor': torch.int64,
+                            'torch.BoolTensor': torch.bool,
+                        }
+                        if dtype in dtype_map:
+                            self._cached_dtype = dtype_map[dtype]
+                        else:
+                            # Try to interpret the string directly
+                            try:
+                                self._cached_dtype = getattr(torch, dtype.split('.')[-1])
+                            except (AttributeError, IndexError):
+                                warnings.warn(f"Could not interpret dtype string: {dtype}")
+                    else:
+                        self._cached_dtype = dtype
+                    return self
+                # If initialized, call original type() method
+                return original_type(dtype, *args, **kwargs)
+            
+            # Override cuda() method
+            original_cuda = self.cuda
+            @functools.wraps(original_cuda)
+            def cuda_wrapper(device=None, *args, **kwargs):
+                if not self._model_initialized:
+                    # Track the device change
+                    if device is None:
+                        self._cached_device = torch.device('cuda')
+                    else:
+                        self._cached_device = torch.device(f'cuda:{device}')
+                    return self
+                # If initialized, call original cuda() method
+                return original_cuda(device, *args, **kwargs)
+            
+            # Override cpu() method
+            original_cpu = self.cpu
+            @functools.wraps(original_cpu)
+            def cpu_wrapper(*args, **kwargs):
+                if not self._model_initialized:
+                    self._cached_device = torch.device('cpu')
+                    return self
+                # If initialized, call original cpu() method
+                return original_cpu(*args, **kwargs)
+            
+            # Assign overridden methods
+            self.to = to_wrapper
+            self.type = type_wrapper
+            self.cuda = cuda_wrapper
+            self.cpu = cpu_wrapper
+            
+            # Save original methods to restore after initialization
+            self._original_methods = {
+                'to': original_to,
+                'type': original_type,
+                'cuda': original_cuda,
+                'cpu': original_cpu,
+            }
 
         @functools.wraps(original_forward)
         def forward_wrapper(self, *args, **kwargs):
@@ -403,6 +499,7 @@ def cache_module(
                     "_cache_subdir",
                     "_memory_cache",
                     "_safe_load",
+                    "_original_methods",
                 ]
             }
 
@@ -416,6 +513,10 @@ def cache_module(
             for k, v in old_state_dict.items():
                 if not hasattr(self, k):
                     setattr(self, k, v)
+
+            # Restore original methods
+            for method_name, original_method in getattr(self, "_original_methods", {}).items():
+                setattr(self, method_name, original_method)
 
             self._model_initialized = True
 

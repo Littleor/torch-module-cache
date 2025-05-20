@@ -38,21 +38,26 @@ class MyModel(nn.Module):
         # Initialize your model here
         self.linear = nn.Linear(10, 5)
         
-    def forward(self, x, cache_key=None):
+    def forward(self, x):
         # The cache_key parameter is injected by the decorator
         # When provided, results will be cached
+        print("Not hit the cache, forwarding", x.shape)
         return self.linear(x)
 
 # Create model instance
 model = MyModel()
 
+print("Normal forward pass (no caching)")
+
 # Normal forward pass (no caching)
 input_tensor = torch.randn(1, 10)
 output = model(input_tensor)
 
+print("Cached forward pass (first time will compute and cache)")
 # Cached forward pass (first time will compute and cache)
 output_cached = model(input_tensor, cache_key="my_unique_key")
 
+print("Subsequent calls with the same key will load from cache")
 # Subsequent calls with the same key will load from cache
 output_from_cache = model(input_tensor, cache_key="my_unique_key")
 ```
@@ -76,11 +81,14 @@ class BatchModel(nn.Module):
             nn.Linear(128, 64)
         )
         
-    def forward(self, x, cache_key=None):
+    def forward(self, x):
+        print("Not hit the cache, forwarding", x.shape)
         return self.encoder(x)
 
 # Create model instance
 model = BatchModel()
+
+print("Begin test")
 
 # Create a batch of inputs
 batch_size = 4
@@ -89,10 +97,12 @@ batch_input = torch.randn(batch_size, 10)
 # Create a list of cache keys (one for each item in the batch)
 batch_keys = ["item1", "item2", "item3", "item4"]
 
+print("Process the entire batch with unique keys for each item")
 # Process the entire batch with unique keys for each item
 # The decorator will handle caching each result individually
 batch_output = model(batch_input, cache_key=batch_keys)
 
+print("The next time you use the same keys, results will be loaded from cache")
 # The next time you use the same keys, results will be loaded from cache
 cached_batch_output = model(batch_input, cache_key=batch_keys)
 ```
