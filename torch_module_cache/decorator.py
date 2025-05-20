@@ -76,6 +76,30 @@ def _get_object_size(obj):
             return 1024 * 1024  # 1MB as a fallback
 
 
+def _move_to_cpu(obj):
+    """Move tensor or collection of tensors to CPU."""
+    if isinstance(obj, torch.Tensor):
+        return obj.cpu().detach()
+    elif isinstance(obj, (list, tuple)):
+        return type(obj)(_move_to_cpu(item) for item in obj)
+    elif isinstance(obj, dict):
+        return {k: _move_to_cpu(v) for k, v in obj.items()}
+    else:
+        return obj
+
+
+def _move_to_device(obj, device):
+    """Move tensor or collection of tensors to specified device."""
+    if isinstance(obj, torch.Tensor):
+        return obj.to(device)
+    elif isinstance(obj, (list, tuple)):
+        return type(obj)(_move_to_device(item, device) for item in obj)
+    elif isinstance(obj, dict):
+        return {k: _move_to_device(v, device) for k, v in obj.items()}
+    else:
+        return obj
+
+
 def cache_module(
     cache_path: Optional[str] = os.path.join(
         os.path.expanduser("~"), ".cache", "torch-module-cache"
@@ -348,7 +372,9 @@ def cache_module(
                 self._cache_level == CacheLevel.MEMORY
                 and cache_key in self._memory_cache
             ):
-                return self._memory_cache[cache_key]
+                # Move the cached result to the target device 
+                cached_result = _move_to_device(self._memory_cache[cache_key], self._cached_device)
+                return cached_result
 
             # Check disk cache if applicable
             if self._cache_enabled and cache_file.exists():
@@ -380,11 +406,13 @@ def cache_module(
                     # Validate the loaded result
                     _validate_cache_result(result)
 
-                    # Also store in memory if memory caching is enabled
+                    # Also store in memory if memory caching is enabled, but keep on CPU
                     if self._cache_level == CacheLevel.MEMORY:
-                        can_cache_in_memory = self._check_and_update_memory_cache_size(result)
+                        # Store on CPU for memory cache
+                        cpu_result = _move_to_cpu(result)
+                        can_cache_in_memory = self._check_and_update_memory_cache_size(cpu_result)
                         if can_cache_in_memory:
-                            self._memory_cache[cache_key] = result
+                            self._memory_cache[cache_key] = cpu_result
 
                     return result
                 except Exception as e:
@@ -413,7 +441,8 @@ def cache_module(
 
                 # Check memory cache first
                 if self._cache_level == CacheLevel.MEMORY and key in self._memory_cache:
-                    results[i] = self._memory_cache[key]
+                    # Move cached result to the right device
+                    results[i] = _move_to_device(self._memory_cache[key], self._cached_device)
                     cache_hit = True
 
                 # If not in memory, check disk cache
@@ -446,11 +475,13 @@ def cache_module(
                             # Store result
                             results[i] = result
 
-                            # Also store in memory if memory caching is enabled
+                            # Also store in memory if memory caching is enabled (on CPU)
                             if self._cache_level == CacheLevel.MEMORY:
-                                can_cache_in_memory = self._check_and_update_memory_cache_size(result)
+                                # Store on CPU for memory cache
+                                cpu_result = _move_to_cpu(result)
+                                can_cache_in_memory = self._check_and_update_memory_cache_size(cpu_result)
                                 if can_cache_in_memory:
-                                    self._memory_cache[key] = result
+                                    self._memory_cache[key] = cpu_result
 
                             cache_hit = True
                         except Exception as e:
@@ -501,15 +532,20 @@ def cache_module(
                                     f"Consider using string keys for better compatibility."
                                 )
 
+                    # Move to CPU for saving to disk
+                    cpu_result = _move_to_cpu(result)
+                    
                     cache_hash = hashlib.md5(str(cache_key).encode()).hexdigest()
                     cache_file = self._cache_subdir / f"{cache_hash}.pt"
-                    torch.save(result, cache_file)
+                    
+                    # Use pickle_protocol=5 for better compression
+                    torch.save(cpu_result, cache_file, _use_new_zipfile_serialization=True, pickle_protocol=5)
 
-                    # Also store in memory if memory caching is enabled
+                    # Also store in memory if memory caching is enabled (store on CPU)
                     if self._cache_level == CacheLevel.MEMORY:
-                        can_cache_in_memory = self._check_and_update_memory_cache_size(result)
+                        can_cache_in_memory = self._check_and_update_memory_cache_size(cpu_result)
                         if can_cache_in_memory:
-                            self._memory_cache[cache_key] = result
+                            self._memory_cache[cache_key] = cpu_result
 
                 except Exception as e:
                     warnings.warn(
