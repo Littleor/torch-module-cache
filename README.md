@@ -14,11 +14,12 @@ A PyTorch module caching decorator that enables efficient caching of module outp
 ## Installation
 
 ```bash
-# Clone the repository
+# 1. Recommend using pip install
+pip install torch-module-cache
+
+# 2. Or clone the repository
 git clone https://github.com/yourusername/torch-module-cache.git
 cd torch-module-cache
-
-# Install the package
 pip install -e .
 ```
 
