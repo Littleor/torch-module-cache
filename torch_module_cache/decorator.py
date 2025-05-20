@@ -4,6 +4,7 @@ import os
 import pickle
 import shutil
 import warnings
+import sys
 from enum import Enum, auto
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
@@ -26,6 +27,7 @@ class SaveMode(Enum):
 
 # Class-specific memory caches - accessible at module level
 _CLASS_MEMORY_CACHES = {}
+_CLASS_MEMORY_CACHE_SIZES = {}  # Store the size of cached items in bytes
 
 
 def clear_disk_caches(cache_name=None):
@@ -53,6 +55,25 @@ def clear_memory_caches(cache_name=None):
     # In a more sophisticated implementation, we could track which cache_name maps to which class ID
     for cache_dict in _CLASS_MEMORY_CACHES.values():
         cache_dict.clear()
+    
+    # Also clear cache size tracking
+    for cache_id in _CLASS_MEMORY_CACHE_SIZES:
+        _CLASS_MEMORY_CACHE_SIZES[cache_id] = 0
+
+
+def _get_object_size(obj):
+    """Estimate the size of an object in bytes."""
+    if isinstance(obj, torch.Tensor):
+        # Calculate tensor memory usage
+        return obj.element_size() * obj.nelement()
+    else:
+        # For non-tensor objects, use sys.getsizeof
+        # This is a rough estimate that doesn't account for all referenced objects
+        try:
+            return sys.getsizeof(obj)
+        except:
+            # If we can't determine the size, use a conservative estimate
+            return 1024 * 1024  # 1MB as a fallback
 
 
 def cache_module(
@@ -62,6 +83,7 @@ def cache_module(
     cache_name: Optional[str] = None,
     cache_level: CacheLevel = CacheLevel.DISK,
     safe_load: bool = True,
+    max_memory_cache_size_mb: Optional[float] = None,
 ):
     """
     Decorator for PyTorch modules to add caching functionality.
@@ -72,6 +94,8 @@ def cache_module(
         cache_name: Name for the cache subfolder. If not specified, uses the module class name
         cache_level: Level of caching (DISK or MEMORY)
         safe_load: If True, uses safer loading options for torch.load to mitigate security risks
+        max_memory_cache_size_mb: Maximum memory cache size in MB. If None, no limit is applied.
+                                 Once the limit is reached, new items will not be cached in memory.
 
     Returns:
         Cached module results which can be of various types:
@@ -92,6 +116,7 @@ def cache_module(
         cache_id = id(cls)
         if cache_id not in _CLASS_MEMORY_CACHES:
             _CLASS_MEMORY_CACHES[cache_id] = {}
+            _CLASS_MEMORY_CACHE_SIZES[cache_id] = 0
 
         original_init = cls.__init__
         original_forward = cls.forward
@@ -112,10 +137,12 @@ def cache_module(
 
             # Store reference to class memory cache
             self._memory_cache = _CLASS_MEMORY_CACHES[cache_id]
+            self._memory_cache_size = _CLASS_MEMORY_CACHE_SIZES[cache_id]
 
             # Set up cache paths and settings
             self._cache_level = cache_level
             self._safe_load = safe_load
+            self._max_memory_cache_size_bytes = None if max_memory_cache_size_mb is None else max_memory_cache_size_mb * 1024 * 1024
 
             if cache_path is None:
                 self._cache_enabled = False
@@ -355,7 +382,9 @@ def cache_module(
 
                     # Also store in memory if memory caching is enabled
                     if self._cache_level == CacheLevel.MEMORY:
-                        self._memory_cache[cache_key] = result
+                        can_cache_in_memory = self._check_and_update_memory_cache_size(result)
+                        if can_cache_in_memory:
+                            self._memory_cache[cache_key] = result
 
                     return result
                 except Exception as e:
@@ -419,7 +448,9 @@ def cache_module(
 
                             # Also store in memory if memory caching is enabled
                             if self._cache_level == CacheLevel.MEMORY:
-                                self._memory_cache[key] = result
+                                can_cache_in_memory = self._check_and_update_memory_cache_size(result)
+                                if can_cache_in_memory:
+                                    self._memory_cache[key] = result
 
                             cache_hit = True
                         except Exception as e:
@@ -432,6 +463,26 @@ def cache_module(
                     missed_indices.append(i)
 
             return results, {"missed_indices": missed_indices}
+
+        def _check_and_update_memory_cache_size(self, result):
+            """
+            Check if a result can be added to the memory cache based on size constraints.
+            Returns True if the result can be added, False otherwise.
+            """
+            # If no max size set, always allow caching
+            if self._max_memory_cache_size_bytes is None:
+                return True
+                
+            # Calculate the size of the result
+            result_size = _get_object_size(result)
+            
+            # If adding this result would exceed the limit, don't cache it
+            if _CLASS_MEMORY_CACHE_SIZES[cache_id] + result_size > self._max_memory_cache_size_bytes:
+                return False
+                
+            # Otherwise, update the size counter and allow caching
+            _CLASS_MEMORY_CACHE_SIZES[cache_id] += result_size
+            return True
 
         def _cache_result(self, cache_key, result):
             """Validate and cache a result for a given key"""
@@ -456,7 +507,9 @@ def cache_module(
 
                     # Also store in memory if memory caching is enabled
                     if self._cache_level == CacheLevel.MEMORY:
-                        self._memory_cache[cache_key] = result
+                        can_cache_in_memory = self._check_and_update_memory_cache_size(result)
+                        if can_cache_in_memory:
+                            self._memory_cache[cache_key] = result
 
                 except Exception as e:
                     warnings.warn(
@@ -498,6 +551,8 @@ def cache_module(
                     "_cache_dir",
                     "_cache_subdir",
                     "_memory_cache",
+                    "_memory_cache_size",
+                    "_max_memory_cache_size_bytes",
                     "_safe_load",
                     "_original_methods",
                 ]
@@ -528,6 +583,7 @@ def cache_module(
         cls._check_and_process_single = _check_and_process_single
         cls._check_cache_batch = _check_cache_batch
         cls._cache_result = _cache_result
+        cls._check_and_update_memory_cache_size = _check_and_update_memory_cache_size
         cls._combine_results = _combine_results
         cls._initialize_model = _initialize_model
 
