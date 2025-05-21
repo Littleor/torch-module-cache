@@ -25,24 +25,42 @@ class SaveMode(Enum):
     FULL = auto()  # Less secure, supports all types but potential security risk
 
 
+# Global cache control
+_GLOBAL_CACHE_ENABLED = True
+_INFERENCE_MODE = False
+
+def enable_global_cache():
+    """Enable caching globally for all cached modules."""
+    global _GLOBAL_CACHE_ENABLED
+    _GLOBAL_CACHE_ENABLED = True
+
+def disable_global_cache():
+    """Disable caching globally for all cached modules."""
+    global _GLOBAL_CACHE_ENABLED
+    _GLOBAL_CACHE_ENABLED = False
+
+def is_global_cache_enabled():
+    """Check if global caching is enabled."""
+    return _GLOBAL_CACHE_ENABLED
+
+def enable_inference_mode():
+    """Enable inference mode which disables caching and initializes models immediately."""
+    global _INFERENCE_MODE, _GLOBAL_CACHE_ENABLED
+    _INFERENCE_MODE = True
+    _GLOBAL_CACHE_ENABLED = False
+
+def disable_inference_mode():
+    """Disable inference mode and restore previous cache settings."""
+    global _INFERENCE_MODE
+    _INFERENCE_MODE = False
+
+def is_inference_mode():
+    """Check if inference mode is enabled."""
+    return _INFERENCE_MODE
+
 # Class-specific memory caches - accessible at module level
 _CLASS_MEMORY_CACHES = {}
 _CLASS_MEMORY_CACHE_SIZES = {}  # Store the size of cached items in bytes
-
-
-def clear_disk_caches(cache_name=None):
-    """Clear disk caches.
-
-    Args:
-        cache_name: If provided, attempt to clear caches specifically for this name
-    """
-    cache_dir = Path.home() / ".cache" / "torch-module-cache"
-    if cache_name is not None:
-        cache_dir = cache_dir / cache_name
-    if cache_dir.exists():
-        # delete the directory
-        shutil.rmtree(cache_dir)
-
 
 def clear_memory_caches(cache_name=None):
     """Clear in-memory caches.
@@ -106,7 +124,7 @@ def cache_module(
     ),
     cache_name: Optional[str] = None,
     cache_level: CacheLevel = CacheLevel.DISK,
-    safe_load: bool = True,
+    safe_load: bool = False,
     max_memory_cache_size_mb: Optional[float] = None,
 ):
     """
@@ -284,30 +302,32 @@ def cache_module(
                 'cpu': original_cpu,
             }
 
+            # Initialize model immediately if in inference mode
+            if _INFERENCE_MODE:
+                self._initialize_model()
+
         @functools.wraps(original_forward)
         def forward_wrapper(self, *args, **kwargs):
             # Get the cache_key from kwargs
             cache_key = kwargs.get("cache_key", None)
+            
+            # Create a copy of kwargs without the cache_key
+            forward_kwargs = {k: v for k, v in kwargs.items() if k != "cache_key"}
 
-            # If no cache_key or caching is disabled
-            if not self._cache_enabled or cache_key is None:
+            # If no cache_key, caching is disabled, or global cache is disabled
+            if not self._cache_enabled or cache_key is None or not _GLOBAL_CACHE_ENABLED:
                 # Initialize if needed and forward
                 if not self._model_initialized:
                     self._initialize_model()
                 # Pass through to original forward method
-                return original_forward(self, *args, **kwargs)
-
-            # Initialize model if not already initialized
-            if not self._model_initialized:
-                self._initialize_model()
+                return original_forward(self, *args, **forward_kwargs)
 
             # Convert single cache_key to list for unified handling
             is_single_key = not isinstance(cache_key, (list, tuple))
             cache_keys = [cache_key] if is_single_key else cache_key
             batch_size = len(cache_keys)
 
-            # Create a copy of kwargs without the cache_key
-            forward_kwargs = {k: v for k, v in kwargs.items() if k != "cache_key"}
+            
 
             # Check if we need batch processing
             if batch_size == 1:
@@ -327,6 +347,10 @@ def cache_module(
                         return results[0]
                     else:
                         return self._combine_results(results)
+
+                # Initialize model if needed before running forward
+                if not self._model_initialized:
+                    self._initialize_model()
 
                 # Run the forward pass once for the entire batch
                 all_results = original_forward(self, *args, **forward_kwargs)
@@ -395,12 +419,14 @@ def cache_module(
                                 "Using default loading method, which could have security implications."
                             )
                             result = torch.load(
-                                cache_file, map_location=self._cached_device
+                                cache_file, map_location=self._cached_device,
+                                weights_only=False
                             )
                     else:
                         # Use standard loading method if safe_load is False
                         result = torch.load(
-                            cache_file, map_location=self._cached_device
+                            cache_file, map_location=self._cached_device,
+                            weights_only=False
                         )
 
                     # Validate the loaded result
@@ -419,6 +445,10 @@ def cache_module(
                     warnings.warn(f"Failed to load cache from {cache_file}: {e}")
 
             # Cache miss - run the forward pass
+            # Initialize model if needed before running forward
+            if not self._model_initialized:
+                self._initialize_model()
+
             # Create new kwargs without the cache_key to avoid passing it to the model
             # (forward_kwargs should already be clean, but we'll double-check)
             forward_kwargs = {k: v for k, v in kwargs.items() if k != "cache_key"}
@@ -454,19 +484,15 @@ def cache_module(
                         try:
                             # Load from disk with appropriate security settings
                             if self._safe_load:
-                                try:
-                                    result = torch.load(
-                                        cache_file,
-                                        map_location=self._cached_device,
-                                        weights_only=True,
-                                    )
-                                except TypeError:
-                                    result = torch.load(
-                                        cache_file, map_location=self._cached_device
-                                    )
+                                result = torch.load(
+                                    cache_file,
+                                    map_location=self._cached_device,
+                                    weights_only=True,
+                                )
                             else:
                                 result = torch.load(
-                                    cache_file, map_location=self._cached_device
+                                    cache_file, map_location=self._cached_device,
+                                    weights_only=False
                                 )
 
                             # Validate the loaded result
